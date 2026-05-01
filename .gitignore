@@ -1,0 +1,15 @@
+# Book text files (copyright)
+*.txt
+!IMPROVEMENTS_AND_EXPLANATION.txt
+
+# Large binary files
+embeddings/
+chunk_metadata.pkl
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Earlier draft notebooks
+GOT_QA.ipynb
+GOT_QA-sc.ipynb
+GOT_QA_Haiku.ipynb

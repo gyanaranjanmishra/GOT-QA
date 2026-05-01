@@ -1,0 +1,857 @@
+================================================================================
+  GAME OF THRONES QA SYSTEM — FULL EXPLANATION + SUGGESTED IMPROVEMENTS
+  File: Improved_GOT_QA.ipynb
+  Written for: Complete beginner to the codebase
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+  SECTION 1: THE BIG PICTURE — WHAT IS THIS SYSTEM DOING?
+────────────────────────────────────────────────────────────────────────────────
+
+Think of this system like a very smart library assistant.
+
+You walk into a library that has 5 huge Game of Thrones books.
+You ask: "Who killed Ned Stark?"
+
+A dumb assistant would read every single page from start to finish.
+That takes forever.
+
+A smart assistant does this:
+  1. Cuts every book into small index cards (CHUNKING)
+  2. Writes a summary number on the back of each card (EMBEDDING)
+  3. Organizes all cards in a filing cabinet sorted by topic (FAISS INDEX)
+  4. When you ask a question, finds the 30 most related cards instantly (RETRIEVAL)
+  5. A senior expert re-reads those 30 cards and picks the most relevant ones (RERANKING)
+  6. A reading specialist reads those cards and extracts the exact answer (QA MODEL)
+
+This is called RAG — Retrieval Augmented Generation.
+  R = Retrieval  (find the right text)
+  A = Augmented  (add that text to the question)
+  G = Generation (generate/extract the answer from it)
+
+
+────────────────────────────────────────────────────────────────────────────────
+  SECTION 2: CELL-BY-CELL EXPLANATION (BEGINNER LEVEL)
+────────────────────────────────────────────────────────────────────────────────
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CELL 1 — GPU Configuration
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CODE:
+  import torch
+  DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+  torch.backends.cuda.matmul.allow_tf32 = True
+
+WHAT IT DOES:
+  Checks whether your computer has a GPU (graphics card) available.
+
+WHY IT MATTERS:
+  A CPU (your main processor) handles one task at a time, sequentially.
+  A GPU (graphics card) has thousands of tiny cores that work in parallel.
+
+  Think of it like this:
+    CPU = 1 very fast delivery truck
+    GPU = 1000 small scooters all delivering at the same time
+
+  Processing 19,268 text chunks through an AI model:
+    On CPU  → might take 30-60 minutes
+    On GPU  → takes about 5 minutes
+
+  "allow_tf32 = True" tells the GPU to use a slightly less precise but much
+  faster number format (TF32). For our purposes the tiny precision loss is
+  completely irrelevant — answers are identical.
+
+OUTPUT: "Running on: cuda" means GPU was found and will be used.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CELL 2 — Loading and Cleaning the Books
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CODE:
+  def clean_text(text):
+      text = re.sub(r"\s+", " ", text)
+      text = text.replace("\n", " ")
+      text = re.sub(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]", "", text)
+      text = text.replace('\ufeff', '')
+      return text.strip()
+
+WHAT IT DOES:
+  Opens each .txt book file and cleans up messy formatting before use.
+
+WHY CLEANING IS NEEDED:
+  The .txt files were likely converted from eBooks or PDFs. They contain:
+
+  1. "\n" (newlines) — everywhere in the middle of sentences:
+     BEFORE: "Eddard Stark\nwas the lord\nof Winterfell"
+     AFTER:  "Eddard Stark was the lord of Winterfell"
+
+  2. Multiple spaces:
+     BEFORE: "He   rode   north"
+     AFTER:  "He rode north"
+
+  3. \ufeff — a BOM (Byte Order Mark). It's an invisible character that
+     some text editors put at the very start of a file as a label. It looks
+     like nothing but confuses the AI model.
+
+  4. Control characters (\x00-\x1F) — invisible characters left over from
+     old formatting. Think of them like hidden sticky notes that were never
+     removed.
+
+  Without cleaning, the AI embeds these noise characters into its
+  understanding of the text, producing worse search results.
+
+EXAMPLE:
+  Raw text:  "Jon\r\nSnow\r\nwas\r\nthe\r\nson   of..."
+  Cleaned:   "Jon Snow was the son of..."
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CELL 3 — Imports
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CODE:
+  import numpy as np
+  import faiss
+  from sentence_transformers import SentenceTransformer, CrossEncoder
+  from transformers import pipeline
+  from nltk.tokenize import sent_tokenize
+
+WHAT EACH LIBRARY DOES:
+
+  numpy       — handles large arrays of numbers efficiently.
+                Think of it as Excel for Python — rows and columns of numbers.
+
+  faiss       — Facebook's library for fast similarity search.
+                Given 19,268 vectors (numbers), find the most similar ones
+                to a query vector in milliseconds. Without faiss, you'd
+                manually compare every single chunk — too slow.
+
+  sentence_transformers
+              — converts sentences/paragraphs into numerical vectors
+                (embeddings). This is how the computer "understands" meaning.
+
+  CrossEncoder
+              — a more powerful but slower model that reads a question AND
+                a passage together and scores their relevance. Better quality
+                than the first-pass search but too slow to use on 19,268 chunks.
+
+  transformers pipeline
+              — provides the question-answering model (RoBERTa) that reads
+                a passage and extracts the answer span.
+
+  sent_tokenize
+              — splits a paragraph into individual sentences. Knows that
+                "Mr. Stark arrived." ends at the period, not after "Mr."
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CELL 4 — Chunking (The Index Card System)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CODE:
+  def sentence_chunker_with_meta(text, book_id, max_words=140, overlap_words=40):
+
+WHAT IT DOES:
+  Cuts each book into small overlapping pieces called "chunks".
+
+WHY WE CHUNK:
+  The embedding model (MPNet) can only process ~512 tokens at once.
+  Book 1 has approximately 298,000 words. That's way too large.
+  We cut it into 140-word pieces and process each piece separately.
+
+WHY SENTENCES, NOT RANDOM CUTS:
+  Bad approach — cutting every 140 words blindly:
+    "...Ned Stark raised his sword. The executioner stepped forwar"
+    ← CUT HERE →
+    "d. Blood sprayed across the snow..."
+  The sentence is broken in half. Both chunks lose meaning.
+
+  Good approach — cutting at sentence boundaries:
+    "...Ned Stark raised his sword. The executioner stepped forward."
+    ← CUT HERE →
+    "Blood sprayed across the snow..."
+  Each chunk is a complete thought.
+
+WHY OVERLAP:
+  Imagine cutting a book at page 50 and 51. The last sentence on page 50
+  might continue the thought on page 51. Without overlap, that connection
+  is lost.
+
+  With 40-word overlap, the last 40 words of chunk N become the first 40
+  words of chunk N+1. So both chunks share a transition zone.
+
+  EXAMPLE:
+    Chunk 3 ends with: "...Jon Snow rode north with his brothers of the
+                         Night's Watch. The Wall loomed ahead."
+
+    Chunk 4 starts with: "...Jon Snow rode north with his brothers of the
+                           Night's Watch. The Wall loomed ahead. [new text]"
+
+    → The overlap ensures continuity. A question about what Jon saw when
+      approaching the Wall can be answered from either chunk.
+
+METADATA:
+  Each chunk stores:
+    chunk_uid : "B1_C42"  → Book 1, Chunk number 42
+    book      : 1         → which of the 5 books
+    chunk_id  : 42        → chunk's position in its book
+    position  : 412       → chunk's global position across all books
+
+  This metadata lets us later find neighboring chunks ("what chunk came
+  just before/after this one?") and know which book the answer came from.
+
+RESULT: 19,268 chunks across all 5 books.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CELL 5 — Embeddings (Converting Text to Numbers)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CODE:
+  model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
+  embeddings = model.encode(batch)  # shape: (19268, 768)
+
+WHAT IS AN EMBEDDING?
+  A computer cannot understand words. It only understands numbers.
+
+  An embedding converts a sentence into a list of 768 numbers (a vector).
+  This vector captures the MEANING of the sentence, not just the words.
+
+  EXAMPLE:
+    "Jon Snow is a bastard"   → [0.21, -0.44, 0.88, ... 768 numbers]
+    "Ned's illegitimate son"  → [0.19, -0.41, 0.85, ... 768 numbers]
+    "The weather is cold"     → [-0.72, 0.33, -0.12, ... 768 numbers]
+
+  Notice: "Jon Snow is a bastard" and "Ned's illegitimate son" produce
+  similar numbers (same meaning, different words).
+  "The weather is cold" produces very different numbers (different topic).
+
+  This is what makes semantic search work — finding chunks that MEAN
+  the same thing as your question, even if they use different words.
+
+WHY 768 DIMENSIONS?
+  Think of a simple 2D map where X = location, Y = elevation.
+  Two points close together on the map are physically close.
+
+  Embeddings work the same way but in 768 dimensions instead of 2.
+  Two embeddings that are close together in 768D space have similar meaning.
+
+  Why 768 and not 2 or 10? Because meaning is complex. You need hundreds
+  of "directions" to capture all the nuances of language.
+
+WHY ALL-MPNET-BASE-V2 SPECIFICALLY?
+  It's one of the best general-purpose sentence embedding models:
+  - 768 dimensions (vs MiniLM's 384) → captures richer meaning
+  - Trained on huge text datasets
+  - Good balance of speed and quality
+
+  The embeddings are saved to embeddings_0.npy (57 MB file) so you don't
+  have to re-run this expensive step every time.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CELL 6 — FAISS Index (The Filing Cabinet)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CODE:
+  embeddings = load_embeddings("embeddings").astype("float32")
+  index = faiss.IndexFlatIP(dim)
+  faiss.normalize_L2(embeddings)
+  index.add(embeddings)
+
+WHAT IS FAISS?
+  Facebook AI Similarity Search. A library that organizes millions of
+  vectors so you can find the most similar ones in milliseconds.
+
+WHAT DOES IndexFlatIP MEAN?
+  "Flat"  → stores all vectors without compression (exact search, not approx.)
+  "IP"    → Inner Product — the similarity metric used
+
+WHAT IS NORMALIZE_L2?
+  Before adding to the index, every vector is scaled so its length = 1.0.
+  This converts Inner Product similarity into Cosine similarity.
+
+  WHY COSINE?
+  Cosine similarity measures the ANGLE between two vectors, not the distance.
+  This matters because:
+    - A long paragraph has a longer raw vector than a short one
+    - We don't want length to affect similarity — only meaning
+    - After normalization, only the direction (meaning) matters
+
+  ANALOGY: Two arrows pointing in the same direction are "similar" even if
+  one is 10cm long and the other is 1m long. Cosine similarity measures
+  the angle between arrows, ignoring length.
+
+HOW SEARCH WORKS:
+  1. Your question "Who killed Ned Stark?" gets encoded into a 768D vector
+  2. That vector is compared against all 19,268 chunk vectors
+  3. FAISS returns the 30 chunks whose vectors point most similarly
+  4. This takes milliseconds (would take minutes without FAISS)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CELL 7 — CrossEncoder Reranker
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CODE:
+  reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+TWO-STAGE RETRIEVAL: WHY?
+
+  Stage 1 (FAISS — Bi-encoder):
+    The question and each chunk are encoded SEPARATELY.
+    Then compared by their vectors.
+    FAST — can scan 19,268 chunks in milliseconds.
+    But LESS ACCURATE — the question and chunk never "see" each other.
+
+    ANALOGY: You describe what you're looking for to a junior librarian.
+    They quickly scan all the shelves and bring you 30 candidate books
+    based on rough topic matching.
+
+  Stage 2 (CrossEncoder — Reranker):
+    The question and each candidate chunk are fed TOGETHER into the model.
+    The model reads both at once and scores their relevance.
+    SLOWER — can only handle the 30 candidates, not all 19,268.
+    But MORE ACCURATE — the model sees the full relationship.
+
+    ANALOGY: A senior expert reads all 30 candidate books alongside your
+    question and ranks them from most to least relevant.
+
+EXAMPLE:
+  Question: "Who is Daenerys's first husband?"
+
+  FAISS top-3 returns:
+    Chunk A: "...Daenerys was sold to Khal Drogo by her brother Viserys..."
+    Chunk B: "...Daenerys thought of her wedding night with fear..."
+    Chunk C: "...Hizdahr zo Loraq asked for Daenerys's hand in marriage..."
+
+  CrossEncoder scores:
+    Chunk A: 8.7  ← best — directly names her first husband
+    Chunk B: 6.2  ← relevant but no name
+    Chunk C: 5.1  ← relevant but second husband
+
+  The reranker correctly identifies Chunk A as most relevant.
+  FAISS alone might have ranked Chunk C higher (also about marriage).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CELL 8 — QA Pipeline (The Answer Extractor)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CODE:
+  qa_pipeline = pipeline(
+      "question-answering",
+      model="deepset/roberta-large-squad2",
+      handle_impossible_answer=False
+  )
+
+WHAT IS ROBERTA?
+  RoBERTa is a language model from Facebook. It was fine-tuned on SQuAD2 —
+  a dataset of 100,000 questions where humans highlighted the exact answer
+  span in Wikipedia articles.
+
+WHAT DOES "EXTRACTIVE" MEAN?
+  This model is EXTRACTIVE — it can ONLY return a word or phrase that
+  literally exists in the context you gave it. It highlights the answer.
+
+  EXAMPLE:
+    Context: "Eddard Stark was beheaded by Ilyn Payne on Joffrey's orders."
+    Question: "Who killed Ned Stark?"
+    Answer:   "Ilyn Payne"  ← copied directly from the context
+
+  It CANNOT say "Joffrey ordered it but Ilyn Payne physically did it."
+  It cannot reason, combine sentences, or synthesize. Only highlight.
+
+WHAT IS SQUAD2?
+  Stanford Question Answering Dataset version 2.
+  Contains questions where the answer IS in the passage AND questions
+  where the answer is NOT in the passage (impossible questions).
+  Training on SQuAD2 makes the model say "I don't know" appropriately.
+
+THE HANDLE_IMPOSSIBLE_ANSWER=False ISSUE:
+  Setting this to False means the model always tries to find an answer
+  even if the context doesn't contain one. This causes it to return
+  garbage spans (like "Eddard" for "who killed Ned") instead of
+  saying "I don't know."
+  → Should be set to True.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CELL 9 — Search Function (Retriever + Reranker)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CODE:
+  def search(question, top_k=30, expand_window=1):
+      q_emb = model.encode([question]).astype("float32")
+      faiss.normalize_L2(q_emb)
+      scores, ids = index.search(q_emb, top_k)
+      candidates = [all_chunks[i] for i in ids[0]]
+
+      pairs = [(question, c["text"]) for c in candidates]
+      rerank_scores = reranker.predict(pairs)
+      reranked = sorted(zip(candidates, rerank_scores), key=lambda x: x[1], reverse=True)
+
+      best_chunk = reranked[0][0]
+      window_chunks = [c for c in all_chunks
+                       if c["book"] == best_chunk["book"]
+                       and abs(c["position"] - best_chunk["position"]) <= expand_window]
+      return sorted(window_chunks, key=lambda x: x["position"])
+
+STEP-BY-STEP WALKTHROUGH:
+
+  Step 1 — Encode the question:
+    "Who killed Ned Stark?" → 768 numbers [0.21, -0.44, ...]
+
+  Step 2 — FAISS search:
+    Compare question vector against all 19,268 chunk vectors.
+    Return 30 most similar chunks (by cosine similarity).
+
+  Step 3 — Rerank:
+    Feed each of the 30 (question, chunk) pairs to CrossEncoder.
+    CrossEncoder reads both and gives each pair a relevance score.
+    Sort by score — most relevant first.
+
+  Step 4 — Window expansion:
+    Take the top-ranked chunk (best_chunk).
+    Find its neighbors: chunks at position best_pos-1, best_pos, best_pos+1
+    (only within the same book).
+    Return these 3 chunks as the final context.
+
+THE BUG HERE:
+  "all_chunks" is used in this function, but it was defined earlier in
+  the notebook during the chunking step. If you restart the kernel and
+  only run the loading cells (load embeddings, load metadata), all_chunks
+  won't exist and this function will crash with a NameError.
+
+  The loaded variable "metadata" contains exactly the same data as
+  all_chunks — but the search function ignores it entirely.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CELL 10 — Answer Function
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CODE:
+  def answer_question(question):
+      chunks = search(question)
+      merged_context = " ".join([c["text"] for c in chunks])
+      result = qa_pipeline(question=question, context=merged_context)
+      if result["score"] < 0.1:
+          return "I don't know", result["score"]
+      return result["answer"].strip(), result["score"]
+
+WHAT HAPPENS:
+  1. search() returns 3 chunks (window of ±1 around best chunk)
+  2. Their text is merged into one big string (merged_context)
+  3. RoBERTa reads the question + merged_context
+  4. RoBERTa highlights the most likely answer span
+  5. If confidence < 0.1, return "I don't know"
+  6. Otherwise return the extracted answer
+
+THE SCORE:
+  result["score"] is a confidence measure from the QA model.
+  It's NOT a true probability (it can exceed 1.0 — a known quirk of
+  roberta-large). It's the sum of start-position logit + end-position logit.
+
+  A score of 1.967 (seen in test output for dragon names) doesn't mean
+  196.7% confident — it means the model's internal numbers happened to
+  add up that way for a very obvious answer in a clean context passage.
+
+THE 0.1 THRESHOLD PROBLEM:
+  The threshold 0.1 is very low. In the test:
+    "who killed ned stark?" → "Eddard" at score 0.108
+  This PASSED the threshold (0.108 > 0.1) and was returned as an answer.
+  But "Eddard" IS Ned Stark — the model found his name in the context
+  and returned it, not the killer. Wrong answer, but just above threshold.
+  Raising to 0.3 would have caught this.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  SECTION 3: EXACT BUGS IN THE CURRENT CODE
+────────────────────────────────────────────────────────────────────────────────
+
+BUG 1 — all_chunks vs metadata mismatch (CRASH RISK)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  LOCATION: search() function + metadata loading cell
+
+  PROBLEM:
+    The search() function uses "all_chunks" which is the in-memory list
+    built during the chunking step. The notebook also loads "metadata"
+    from chunk_metadata.pkl — but then never uses it.
+
+    If you restart the kernel and skip the chunking cells (they take time),
+    "all_chunks" doesn't exist → search() crashes with NameError.
+
+  CURRENT CODE:
+    with open("chunk_metadata.pkl", "rb") as f:
+        metadata = pickle.load(f)   ← loaded but never used
+
+    def search(question, ...):
+        candidates = [all_chunks[i] ...]   ← uses wrong variable
+
+  FIX:
+    After loading metadata, add one line:
+      all_chunks = metadata
+
+    This makes the loaded data available under the expected name,
+    so the system works whether or not chunking was re-run.
+
+──────────────────────────────────────────────────────────────────────────────
+
+BUG 2 — Window Expansion Too Narrow
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  LOCATION: search() function, parameter expand_window=1
+
+  PROBLEM:
+    expand_window=1 means the system only looks at:
+      - the chunk BEFORE the best match (position - 1)
+      - the best match itself (position)
+      - the chunk AFTER the best match (position + 1)
+
+    That is 3 chunks × 140 words = ~420 words of context.
+
+    For a story question that spans multiple paragraphs or scenes,
+    420 words is often not enough. The answer might be 10 chunks
+    away in the same chapter.
+
+    EXAMPLE:
+      Q: "Who ordered the Red Wedding?"
+      The setup (Walder Frey's grievance) is in chunk 840.
+      The actual order being given is in chunk 855.
+      The execution happens in chunk 863.
+      With expand_window=1, you might get chunks 854-856 and miss
+      the critical setup that gives the full answer.
+
+  FIX:
+    Change expand_window=1 to expand_window=4 or 5.
+    This gives 9-11 chunks = ~1,400 words of context.
+
+──────────────────────────────────────────────────────────────────────────────
+
+BUG 3 — Reranked Results Wasted
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  LOCATION: search() function, after reranking
+
+  PROBLEM:
+    The CrossEncoder carefully ranks all 30 candidates.
+    But then only the #1 ranked chunk's NEIGHBORS are used.
+    Ranks #2 through #30 are thrown away.
+
+    The #2 and #3 ranked chunks might be from a different book
+    but contain highly relevant information — and they're ignored.
+
+  EXAMPLE:
+    Q: "How many times was Daenerys married?"
+    Rank 1: Book 1 chunk about Khal Drogo marriage
+    Rank 2: Book 5 chunk about Hizdahr marriage  ← discarded!
+    Rank 3: Book 5 chunk about her refusing marriage ← discarded!
+
+    The current code gives context ONLY from Book 1 and misses
+    the complete answer that needs Books 1 and 5.
+
+  FIX:
+    Instead of only using window around rank-1, take the top 3
+    reranked chunks AND their window neighbors.
+    This gives richer cross-book context.
+
+──────────────────────────────────────────────────────────────────────────────
+
+BUG 4 — Score Threshold Too Low
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  LOCATION: answer_question() function
+
+  CURRENT:  if result["score"] < 0.1: return "I don't know"
+  PROBLEM:  0.1 is nearly zero — almost any answer passes this.
+
+  EVIDENCE FROM TEST OUTPUT:
+    "who killed ned stark?" → "Eddard" at score 0.108
+    "Eddard" is the VICTIM, not the killer.
+    This wrong answer was returned because 0.108 > 0.1.
+    At threshold 0.3, this would correctly say "I don't know".
+
+  FIX:  raise to 0.3
+
+──────────────────────────────────────────────────────────────────────────────
+
+BUG 5 — Confidence Score Can Exceed 1.0
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  EVIDENCE: "DROGON, VISERION, RHAEGAL" → Confidence: 1.967
+
+  CAUSE:
+    RoBERTa-large computes its answer as:
+      score = softmax(start_logit) + softmax(end_logit)
+    Both values are between 0 and 1, so their sum can reach up to 2.0.
+    This is not a true probability — it's an internal scoring artifact.
+
+  FIX:
+    Cap the score for display and thresholding:
+      score = min(result["score"], 1.0)
+
+──────────────────────────────────────────────────────────────────────────────
+
+BUG 6 — handle_impossible_answer=False
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  LOCATION: qa_pipeline initialization
+
+  PROBLEM:
+    When set to False, RoBERTa ALWAYS tries to find an answer span,
+    even when the context doesn't contain one.
+    This causes hallucinated answers like:
+      "who is the night king?" → returns a random name from context
+    instead of saying "I don't know."
+
+  FIX:
+    Change to: handle_impossible_answer=True
+    Then the model can explicitly output an empty answer with low score,
+    which gets caught by the threshold check.
+
+──────────────────────────────────────────────────────────────────────────────
+
+BUG 7 — Word-based Chunking (Not Token-based)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  LOCATION: sentence_chunker_with_meta(), max_words=140
+
+  PROBLEM:
+    "Word" and "Token" are not the same thing.
+    The embedding model (MPNet) has a hard limit of 512 TOKENS.
+
+    Words vs Tokens:
+      "don't"     = 1 word, 2 tokens (do + n't)
+      "Daenerys"  = 1 word, 3 tokens (Da + ener + ys)
+      "Winterfell" = 1 word, 3 tokens (Winter + fell)
+
+    A chunk of 140 "words" might actually be 200+ tokens for GOT text
+    because character/place names tokenize into many pieces.
+    If a chunk exceeds 512 tokens, MPNet silently truncates it.
+    The end of the chunk is simply cut off during embedding.
+
+  FIX:
+    Use token count instead of word count:
+
+      from transformers import AutoTokenizer
+      tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-mpnet-base-v2")
+
+      def count_tokens(text):
+          return len(tokenizer.encode(text, add_special_tokens=False))
+
+    Then check token count instead of word count in the chunker.
+    Use max_tokens=400 to stay safely under the 512 limit.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  SECTION 4: WHY ROBERTA FAILS ON STORY QUESTIONS
+────────────────────────────────────────────────────────────────────────────────
+
+RoBERTa is an EXTRACTIVE model. It was designed for factual, Wikipedia-style
+questions where the answer is a single phrase in a single paragraph.
+
+  WHAT IT IS GOOD AT:
+    Q: "What is the capital of France?"
+    Context: "Paris is the capital and largest city of France."
+    A: "Paris"  ← exact span lifted from text ✓
+
+  WHAT IT FAILS AT:
+
+  1. CAUSAL/REASONING QUESTIONS:
+    Q: "Why did the Red Wedding happen?"
+    There is no single sentence in the books that states the reason.
+    You need to combine: Robb breaking his oath + Walder Frey's grievance
+    + Tywin Lannister's scheming.
+    RoBERTa can only copy a span — it cannot combine multiple reasons.
+
+  2. INDIRECT ANSWERS:
+    Q: "Who killed Ned Stark?"
+    The books say: "Joffrey commanded... Ilyn Payne raised the sword..."
+    The "killer" is ambiguous — Joffrey ordered, Ilyn executed.
+    RoBERTa finds "Eddard" (Ned's real name) near "death" in context
+    and returns it. Wrong.
+
+  3. CROSS-CHUNK INFORMATION:
+    Q: "What were the names of all of Daenerys's dragons?"
+    Dragon names appear in multiple chapters across Books 1-5.
+    RoBERTa only reads what's in the merged_context window.
+    If not all three names appear in those 3 chunks, the answer is incomplete.
+
+  4. OPINION/INTERPRETATION:
+    Q: "Is Jon Snow a good leader?"
+    No extractable span exists. This requires synthesis.
+    RoBERTa would return random text.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  SECTION 5: COST COMPARISON — ROBERTA vs CLAUDE API
+────────────────────────────────────────────────────────────────────────────────
+
+ROBERTA (CURRENT):
+  ─────────────────────────────────────────────────────
+  Cost per question:    $0.00  (runs locally on GPU)
+  Speed per question:   ~0.5–2 seconds on GPU
+  GPU memory needed:    ~1.3 GB (roberta-large)
+  Internet required:    No (after initial download)
+  Answer quality:       Limited — extractive only
+  Can synthesize:       No
+  Can reason:           No
+  ─────────────────────────────────────────────────────
+
+CLAUDE API (PROPOSED REPLACEMENT):
+  ─────────────────────────────────────────────────────
+  Per question cost breakdown:
+
+    Input tokens per query:
+      - System prompt:      ~100 tokens
+      - Context (9 chunks): ~1,260 tokens  (9 × 140 words ≈ 140 tokens each)
+      - Question:           ~20 tokens
+      - Total input:        ~1,380 tokens
+
+    Output tokens per query:
+      - Answer:             ~50–100 tokens
+
+  CLAUDE HAIKU (claude-haiku-4-5-20251001) — cheapest, fastest:
+    Input:   $0.80 per 1 million tokens
+    Output:  $4.00 per 1 million tokens
+
+    Per question:
+      Input cost:  1,380 / 1,000,000 × $0.80  = $0.0011
+      Output cost: 80    / 1,000,000 × $4.00  = $0.0003
+      TOTAL:                                    ~$0.0014 per question
+
+    In plain terms:
+      10 questions   → ~$0.014  (1.4 cents)
+      100 questions  → ~$0.14   (14 cents)
+      1,000 questions → ~$1.40  ($1.40)
+
+  CLAUDE SONNET (claude-sonnet-4-6) — better quality:
+    Input:   $3.00 per 1 million tokens
+    Output:  $15.00 per 1 million tokens
+
+    Per question:
+      Input cost:  1,380 / 1,000,000 × $3.00  = $0.0041
+      Output cost: 80    / 1,000,000 × $15.00 = $0.0012
+      TOTAL:                                    ~$0.0053 per question
+
+    In plain terms:
+      10 questions   → ~$0.05   (5 cents)
+      100 questions  → ~$0.53   (53 cents)
+      1,000 questions → ~$5.30
+
+  ─────────────────────────────────────────────────────
+  RECOMMENDATION: Use Claude Haiku for this project.
+  For a personal GOT QA system, you'd spend pennies per session.
+  You already have the API key from the job tracker project.
+  ─────────────────────────────────────────────────────
+
+WHY CLAUDE IS DRAMATICALLY BETTER FOR THIS USE CASE:
+  Claude is a GENERATIVE model. It reads the retrieved context and
+  composes an answer — it doesn't just highlight a span.
+
+  EXAMPLE comparison:
+
+  Q: "Who killed Ned Stark?"
+
+  Context given:
+    "...Joffrey commanded the execution. Ser Ilyn Payne, the King's
+    Justice, stepped forward and raised Ice, Ned's own sword. The crowd
+    fell silent as he swung..."
+
+  RoBERTa answer: "Eddard"  ← found nearby, wrong span
+  Claude answer:  "Ser Ilyn Payne carried out the execution on Joffrey's
+                   orders, using Ned's own sword, Ice."
+
+  Claude understands causality, agency, and context.
+  RoBERTa can only copy words.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  SECTION 6: COMPLETE LIST OF SUGGESTED CHANGES
+────────────────────────────────────────────────────────────────────────────────
+
+CHANGE 1 — Fix all_chunks / metadata mismatch (1 line)
+  WHERE:  After the metadata loading cell
+  ADD:    all_chunks = metadata
+  WHY:    Prevents NameError crash if kernel is restarted
+
+CHANGE 2 — Increase expand_window from 1 to 4 (1 line)
+  WHERE:  search() function default parameter
+  FROM:   def search(question, top_k=30, expand_window=1)
+  TO:     def search(question, top_k=30, expand_window=4)
+  WHY:    Gives QA model ~1,260 words of context instead of ~420
+
+CHANGE 3 — Use top-3 reranked chunks + their windows (10 lines)
+  WHERE:  search() function, after reranking step
+  WHY:    Currently only uses rank-1 and its neighbors.
+          Top-3 captures cross-book answers and multi-scene information.
+
+CHANGE 4 — Raise score threshold from 0.1 to 0.3 (1 line)
+  WHERE:  answer_question() function
+  FROM:   if result["score"] < 0.1
+  TO:     if result["score"] < 0.3
+  WHY:    Filters out low-quality extractions like "Eddard" for
+          "who killed Ned Stark?"
+
+CHANGE 5 — Cap score at 1.0 (1 line)
+  WHERE:  answer_question() function
+  ADD:    score = min(result["score"], 1.0)
+  WHY:    Prevents confidence values like 1.967 from displaying
+
+CHANGE 6 — Fix handle_impossible_answer (1 word)
+  WHERE:  qa_pipeline initialization
+  FROM:   handle_impossible_answer=False
+  TO:     handle_impossible_answer=True
+  WHY:    Allows model to explicitly say "no answer" instead of
+          returning random text with low confidence
+
+CHANGE 7 — Switch to token-based chunking (20 lines)
+  WHERE:  sentence_chunker_with_meta() function
+  WHY:    Prevents silent truncation of chunks by MPNet's 512 token limit
+
+CHANGE 8 — Replace RoBERTa with Claude API (MAJOR — ~50 lines)
+  WHERE:  answer_question() function + qa_pipeline initialization
+  WHY:    Fixes the fundamental limitation — extractive vs generative.
+          Claude can reason, synthesize, and give complete answers.
+          Cost: ~$0.0014 per question with Haiku model.
+  HOW:    Replace qa_pipeline call with Anthropic API call:
+          - Build a prompt with the retrieved context
+          - Ask Claude to answer the question using only the context
+          - Claude returns a complete, reasoned answer
+
+CHANGE 9 — Add source attribution to answers (10 lines)
+  WHERE:  answer_question() function
+  WHY:    Tells you which book and approximate chapter the answer came from.
+          Useful for verification.
+  HOW:    Return chunk metadata alongside the answer:
+          "Answer: Ilyn Payne (Source: Book 1, Chapter ~65)"
+
+
+────────────────────────────────────────────────────────────────────────────────
+  SECTION 7: RECOMMENDED ORDER OF IMPLEMENTATION
+────────────────────────────────────────────────────────────────────────────────
+
+  Step 1 (Quick fixes — do first, no architecture change):
+    - Change 1: Fix all_chunks = metadata
+    - Change 4: Raise threshold to 0.3
+    - Change 5: Cap score at 1.0
+    - Change 6: handle_impossible_answer=True
+    - Change 2: expand_window = 4
+
+  Step 2 (Better retrieval — moderate change):
+    - Change 3: Use top-3 reranked + windows
+    - Change 7: Token-based chunking (needs re-embedding — slow step)
+
+  Step 3 (Major upgrade — replaces QA model entirely):
+    - Change 8: Replace RoBERTa with Claude API
+    - Change 9: Add source attribution
+
+  NOTE: Changes 1, 2, 4, 5, 6 can be applied immediately without
+  re-running the embedding step (which takes 5+ minutes).
+  Change 7 requires re-chunking and re-embedding all books.
+  Change 8 requires the Anthropic API key from .env.local.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  END OF DOCUMENT
+  Last updated: 2026-04-04
+  Project: /home/gyana/GOT/Improved_GOT_QA.ipynb
+────────────────────────────────────────────────────────────────────────────────
